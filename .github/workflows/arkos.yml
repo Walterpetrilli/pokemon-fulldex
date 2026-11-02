@@ -1,0 +1,214 @@
+# Builds Pokemon Fulldex as a port for ArkOS handhelds (R36S and other RK3326 devices).
+# The program is compiled inside Ubuntu 19.10 for ARM64, the base of ArkOS, so it only asks
+# for the glibc (2.30) the console already has. No ROM is needed or used: the build takes the
+# synthetic fixture the project's own CI uses, and the function tables come from the
+# decompilations' symbol files, as in tools/pc/build_all.sh. SoulSilver and HeartGold's own
+# layouts need tables made from a SoulSilver ROM, so they are not in this build.
+name: ArkOS port (R36S)
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - .github/workflows/arkos.yml
+permissions:
+  contents: read
+jobs:
+  arkos:
+    runs-on: ubuntu-24.04-arm
+    env:
+      SDL_VERSION: 2.30.9
+      SDL_SHA256: 24b574f71c87a763f50704bbb630cbe38298d544a1f890f099a4696b1d6beba4
+      CMAKE_VERSION: 3.27.9
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Synthetic generated sources (no ROM)
+        run: python3 tests/native_smoke.py --build-dir "$PWD/build-arkos/smoke" --fixture-only
+
+      - name: Function tables (Black, White, Black 2, White 2, Platinum, Diamond)
+        run: |
+          set -euo pipefail
+          fetch_symbols() { # dir url commit paths...
+            local dir="$1" url="$2" commit="$3"; shift 3
+            git init -q "$dir"
+            git -C "$dir" remote add origin "$url"
+            git -C "$dir" sparse-checkout set --no-cone "$@"
+            git -C "$dir" fetch -q --depth 1 --filter=blob:none origin "$commit"
+            git -C "$dir" checkout -q --force FETCH_HEAD
+          }
+          # (The same decompilations and versions as tools/pc/build_all.sh.)
+          BW2=https://github.com/fuddlesworth/pokebw2.git
+          BW1=https://github.com/Project-Holon/aletheia.git
+          D=build-arkos/funcs
+          mkdir -p "$D"
+          fetch_symbols build-arkos/pokebw2 "$BW2" 753b3fd97683fc619bb98b52e7276afac3d5e32f \
+            '/config/b2_us/arm9/symbols.txt' '/config/b2_us/arm9/*/symbols.txt' '/config/b2_us/arm9/overlays/*/symbols.txt'
+          fetch_symbols build-arkos/pokew2 "$BW2" be2c125a700c23702ba1c5a4ef63e0e970bcc87a \
+            '/config/w2_us/arm9/symbols.txt' '/config/w2_us/arm9/*/symbols.txt' '/config/w2_us/arm9/overlays/*/symbols.txt'
+          fetch_symbols build-arkos/aletheia "$BW1" 0d05b6ccc61fcea090d8318a00af9f1634810e18 '/layout/function_addrs.tsv'
+          python3 tools/bw2/funcmap.py build-arkos/pokebw2/config/b2_us/arm9 - "$D/IREO.txt"
+          python3 tools/bw2/funcmap.py build-arkos/pokew2/config/w2_us/arm9 - "$D/IRDO.txt"
+          python3 tools/bw1/funcmap.py build-arkos/aletheia/layout/function_addrs.tsv - "$D/IRBO.txt"
+          python3 tools/bw1/funcmap.py build-arkos/aletheia/layout/function_addrs.tsv - "$D/IRAO.txt" --white
+          cp tools/platinum/CPUE.txt tools/platinum/ADAE.txt "$D/"
+          python3 tools/shift_table.py --all "$D"
+          cp tools/regions/{IREF,IRDF,CPUF,IRBF,IRAF}.txt "$D/"
+          ls -l "$D"
+
+      - name: Downloads for the build (CMake for ARM64, SDL2's source)
+        run: |
+          set -euo pipefail
+          mkdir -p build-arkos/dl
+          curl -fsSL -o build-arkos/dl/cmake.tar.gz \
+            "https://github.com/Kitware/CMake/releases/download/v$CMAKE_VERSION/cmake-$CMAKE_VERSION-linux-aarch64.tar.gz"
+          tar -xzf build-arkos/dl/cmake.tar.gz -C build-arkos/dl
+          mv "build-arkos/dl/cmake-$CMAKE_VERSION-linux-aarch64" build-arkos/dl/cmake
+          curl -fsSL -o build-arkos/dl/sdl.tar.gz \
+            "https://github.com/libsdl-org/SDL/releases/download/release-$SDL_VERSION/SDL2-$SDL_VERSION.tar.gz"
+          echo "$SDL_SHA256  build-arkos/dl/sdl.tar.gz" | sha256sum -c
+          tar -xzf build-arkos/dl/sdl.tar.gz -C build-arkos/dl
+
+      - name: Compile inside Ubuntu 19.10 ARM64 (ArkOS's base)
+        run: |
+          set -euo pipefail
+          cat > build-arkos/inner.sh <<'INNER'
+          set -euxo pipefail
+          W="$1"
+          # Ubuntu 19.10 is out of support: its packages are on old-releases.
+          sed -i -E 's#http://(ports|archive|security)\.ubuntu\.com/ubuntu(-ports)?#http://old-releases.ubuntu.com/ubuntu#g' /etc/apt/sources.list
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential ninja-build pkg-config patchelf binutils file \
+            libdrm-dev libgbm-dev libegl1-mesa-dev libgles2-mesa-dev libasound2-dev libudev-dev zlib1g-dev
+          ldd --version 2>&1 | sed -n 1p
+          g++ --version | sed -n 1p
+          export PATH="$W/build-arkos/dl/cmake/bin:$PATH"
+          # SDL2 for KMSDRM (no X11 or Wayland on ArkOS) and ALSA, with OpenGL ES; its drivers
+          # are opened at run time, so it only needs the C library.
+          cmake -S "$W/build-arkos/dl/SDL2-$SDL_VERSION" -B /tmp/sdl -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX=/opt/sdl2 -DSDL_SHARED=ON -DSDL_STATIC=OFF -DSDL_TEST=OFF -DSDL_TESTS=OFF -DSDL_RPATH=OFF \
+            -DSDL_X11=OFF -DSDL_WAYLAND=OFF -DSDL_PULSEAUDIO=OFF -DSDL_PIPEWIRE=OFF -DSDL_JACK=OFF \
+            -DSDL_SNDIO=OFF -DSDL_KMSDRM=ON -DSDL_ALSA=ON -DSDL_OPENGL=OFF -DSDL_OPENGLES=ON -DSDL_VULKAN=OFF
+          ninja -C /tmp/sdl install
+          grep -q '#define SDL_VIDEO_DRIVER_KMSDRM 1' /tmp/sdl/include-config-release/SDL2/SDL_config.h
+          # The game: the JIT for every game, no OpenGL (the merged view is drawn by the processor),
+          # tuned for the Cortex-A35, with the C++ library inside it.
+          cmake -S "$W" -B "$W/build-arkos/game" -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DSSR_JIT=ON -DSSR_PC_ALL_GAMES=ON -DSSR_PNG=OFF -DSSR_GPU3D=OFF \
+            -DSSR_GENERATED_DIR="$W/build-arkos/smoke/generated fixtures with spaces" \
+            -DCMAKE_PREFIX_PATH=/opt/sdl2 \
+            -DCMAKE_C_FLAGS="-mcpu=cortex-a35" -DCMAKE_CXX_FLAGS="-mcpu=cortex-a35" \
+            -DCMAKE_EXE_LINKER_FLAGS="-static-libstdc++ -static-libgcc"
+          ninja -C "$W/build-arkos/game" ssrecomp
+          O="$W/build-arkos/out"
+          mkdir -p "$O/libs"
+          cp "$W/build-arkos/game/ssrecomp" "$O/pokemon-ds-wide"
+          strip "$O/pokemon-ds-wide"
+          # (No fixed library folder: the console's own SDL2 first, the one built here as a fallback.)
+          patchelf --remove-rpath "$O/pokemon-ds-wide"
+          cp -L /opt/sdl2/lib/libSDL2-2.0.so.0 "$O/libs/libSDL2-2.0.so.0"
+          strip "$O/libs/libSDL2-2.0.so.0"
+          file "$O/pokemon-ds-wide"
+          readelf -d "$O/pokemon-ds-wide" | grep NEEDED
+          # Nothing newer than ArkOS's glibc 2.30.
+          if objdump -T "$O/pokemon-ds-wide" "$O/libs/libSDL2-2.0.so.0" | grep -E 'GLIBC_2\.(3[1-9]|[4-9][0-9])'; then
+            echo "needs a glibc newer than ArkOS's"; exit 1
+          fi
+          chown -R "$2" "$W/build-arkos"
+          INNER
+          docker run --rm --platform linux/arm64 -e SDL_VERSION \
+            -v "$GITHUB_WORKSPACE:$GITHUB_WORKSPACE" -w "$GITHUB_WORKSPACE" ubuntu:19.10 \
+            bash "$GITHUB_WORKSPACE/build-arkos/inner.sh" "$GITHUB_WORKSPACE" "$(id -u):$(id -g)"
+
+      - name: The port folder
+        run: |
+          set -euo pipefail
+          P=dist/ports
+          G="$P/pokemonfulldex"
+          mkdir -p "$G/roms" "$G/saves" "$G/data"
+          cp build-arkos/out/pokemon-ds-wide "$G/"
+          cp -r build-arkos/out/libs "$G/libs"
+          cp -r build-arkos/funcs "$G/data/funcs"
+          cp LICENSE "$G/LICENSE.txt"
+          cp "build-arkos/dl/SDL2-$SDL_VERSION/LICENSE.txt" "$G/LICENSE-SDL2.txt"
+          touch "$G/roms/.keep" "$G/saves/.keep"
+
+          # The R36S's settings to start with: the two screens merged into one, no widescreen
+          # (the 640x480 screen is 4:3, and the processor could not draw it), no in-between
+          # frames, the right stick as the touch cursor (L2 touches), START opening the menu.
+          cat > "$G/settings.default.cfg" <<'CFG'
+          view=merged
+          large_screen=auto
+          fullscreen=1
+          smooth=0
+          wide=0
+          wide_map=0
+          busy_detail=0
+          buttons=labels
+          fps60=0
+          pad_touch=1
+          show_fps=1
+          ff_low_res=1
+          volume=100
+          start_button=menu
+          battle_buttons=strip
+          both_versions=0
+          ra=0
+          CFG
+
+          cat > "$P/Pokemon Fulldex.sh" <<'SH'
+          #!/bin/bash
+          # Pokemon Fulldex for ArkOS (R36S): the DS Pokemon games with both screens in one view.
+          XDG_DATA_HOME=${XDG_DATA_HOME:-$HOME/.local/share}
+          if [ -d "/opt/system/Tools/PortMaster/" ]; then
+            controlfolder="/opt/system/Tools/PortMaster"
+          elif [ -d "/opt/tools/PortMaster/" ]; then
+            controlfolder="/opt/tools/PortMaster"
+          elif [ -d "$XDG_DATA_HOME/PortMaster/" ]; then
+            controlfolder="$XDG_DATA_HOME/PortMaster"
+          else
+            controlfolder="/roms/ports/PortMaster"
+          fi
+          if [ -f "$controlfolder/control.txt" ]; then
+            source "$controlfolder/control.txt"
+            [ -f "${controlfolder}/mod_${CFW_NAME}.txt" ] && source "${controlfolder}/mod_${CFW_NAME}.txt"
+            get_controls
+          fi
+
+          GAMEDIR="/${directory:-roms}/ports/pokemonfulldex"
+          cd "$GAMEDIR" || exit 1
+          > "$GAMEDIR/log.txt" && exec > >(tee "$GAMEDIR/log.txt") 2>&1
+
+          [ -f settings.cfg ] || cp settings.default.cfg settings.cfg
+          chmod +x ./pokemon-ds-wide 2>/dev/null
+          [ -n "$sdl_controllerconfig" ] && export SDL_GAMECONTROLLERCONFIG="$sdl_controllerconfig"
+          # No updates from the PC release (they would replace this build with the PC one).
+          export FULLDEX_UPDATE_URL="file:///nonexistent"
+
+          # SELECT + START closes it if it ever hangs (QUIT in its menu is the clean way).
+          [ -n "$GPTOKEYB" ] && $GPTOKEYB "pokemon-ds-wide" &
+          command -v pm_platform_helper >/dev/null && pm_platform_helper "$GAMEDIR/pokemon-ds-wide"
+
+          # The console's own SDL2 first; the one in libs/ if that is missing or too old
+          # (or always, with a file named use-bundled-sdl in this folder).
+          if [ -f use-bundled-sdl ]; then
+            LD_LIBRARY_PATH="$GAMEDIR/libs:$LD_LIBRARY_PATH" ./pokemon-ds-wide
+          else
+            ./pokemon-ds-wide
+            if [ $? -eq 127 ]; then
+              echo "[arkos] the system SDL2 did not work: trying the one in libs/"
+              LD_LIBRARY_PATH="$GAMEDIR/libs:$LD_LIBRARY_PATH" ./pokemon-ds-wide
+            fi
+          fi
+
+          command -v pm_finish >/dev/null && pm_finish
+          pkill -f gptokeyb 2>/dev/null
+          printf "\033c" > /dev/tty1
+          SH
+          chmod +x "$P/Pokemon Fulldex.sh" "$G/pokemon-ds-wide"
+          find dist -type f | sort
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pokemon-fulldex-arkos
+          path: dist/
